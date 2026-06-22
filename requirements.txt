@@ -1,7 +1,7 @@
 streamlit>=1.35.0
 
 # Core NLP
-spacy>=3.7.0
+spacy==3.8.4
 
 # spaCy multilingual model
 https://github.com/explosion/spacy-models/releases/download/xx_ent_wiki_sm-3.7.0/xx_ent_wiki_sm-3.7.0-py3-none-any.whl
