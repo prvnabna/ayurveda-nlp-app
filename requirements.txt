@@ -4,7 +4,12 @@
 # ── Streamlit UI ──────────────────────────────────────────────
 streamlit>=1.35.0
 
-# ── Core NLP — IMPORTANT: spacy must stay <3.8.0 for xx-ent-wiki-sm ──
+# ── numpy MUST be pinned to <2.0 — spaCy/thinc wheels are compiled
+#    against numpy 1.x; numpy 2.x causes binary incompatibility on
+#    Streamlit Cloud (ValueError: numpy.dtype size changed)
+numpy>=1.24.0,<2.0.0
+
+# ── Core NLP — spacy must stay <3.8.0 for xx-ent-wiki-sm 3.7.0 ──
 spacy>=3.7.0,<3.8.0
 https://github.com/explosion/spacy-models/releases/download/xx_ent_wiki_sm-3.7.0/xx_ent_wiki_sm-3.7.0-py3-none-any.whl
 
@@ -20,5 +25,5 @@ regex>=2024.0.0
 tqdm>=4.66.0
 
 # ── Data / output formats ─────────────────────────────────────
-pandas>=2.0.0
+pandas>=2.0.0,<3.0.0
 openpyxl>=3.1.0
