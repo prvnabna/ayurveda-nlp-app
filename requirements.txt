@@ -1,29 +1,22 @@
-# Ayurveda NLP Pipeline — Streamlit App
-# Install: pip install -r requirements.txt
-
-# ── Streamlit UI ──────────────────────────────────────────────
 streamlit>=1.35.0
 
-# ── Core NLP ──────────────────────────────────────────────────
+# Core NLP
 spacy>=3.7.0
-# Run after install:
-#   python -m spacy download xx_ent_wiki_sm
-#   python -m spacy download en_core_web_sm
 
-# ── Transformer models (optional — heavy download) ────────────
-# transformers>=4.40.0
-# torch>=2.0.0
+# spaCy multilingual model
+https://github.com/explosion/spacy-models/releases/download/xx_ent_wiki_sm-3.7.0/xx_ent_wiki_sm-3.7.0-py3-none-any.whl
 
-# ── Indic NLP (optional) ─────────────────────────────────────
-# indic-nlp-library>=0.92
-
-# ── Dependency parsing (optional — Sanskrit) ──────────────────
-# stanza>=1.8.0
-
-# ── Utilities ─────────────────────────────────────────────────
-regex>=2024.0.0
-tqdm>=4.66.0
-
-# ── Data / output formats ─────────────────────────────────────
+# Data Processing
 pandas>=2.0.0
 openpyxl>=3.1.0
+
+# Document Processing
+python-docx>=1.1.0
+pymupdf>=1.24.0
+
+# Evaluation
+jiwer>=3.0.0
+
+# Utilities
+regex>=2024.0.0
+tqdm>=4.66.0
