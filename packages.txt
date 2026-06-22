@@ -1,0 +1,2 @@
+# System packages for Streamlit Cloud
+# (needed for some spaCy tokenizers)
