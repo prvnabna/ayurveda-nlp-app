@@ -118,6 +118,97 @@ TASK_META = {
 PIPELINE_ORDER = [1, 2, 3, 5, 6, 7, 8]
 
 
+# ── Text extraction helpers ───────────────────────────────────────────
+def extract_text_from_docx(file_bytes: bytes, filename: str) -> str:
+    """Extract plain text from a .docx file using python-docx."""
+    try:
+        import docx
+        import io as _io
+        doc = docx.Document(_io.BytesIO(file_bytes))
+        paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+        return "\n".join(paragraphs)
+    except ImportError:
+        raise RuntimeError(
+            "python-docx is not installed. Run: pip install python-docx"
+        )
+    except Exception as e:
+        raise RuntimeError(f"Failed to read {filename}: {e}")
+
+
+def extract_text_from_pdf(file_bytes: bytes, filename: str) -> str:
+    """Extract plain text from a .pdf file using pdfminer.six (preferred) or PyPDF2."""
+    # Try pdfminer.six first (better text extraction)
+    try:
+        import pdfminer.high_level as pdfminer_hl
+        import io as _io
+        text = pdfminer_hl.extract_text(_io.BytesIO(file_bytes))
+        if text and text.strip():
+            return text
+    except ImportError:
+        pass
+
+    # Fall back to PyPDF2
+    try:
+        import PyPDF2
+        import io as _io
+        reader = PyPDF2.PdfReader(_io.BytesIO(file_bytes))
+        pages = [reader.pages[i].extract_text() or "" for i in range(len(reader.pages))]
+        text = "\n".join(pages)
+        if text.strip():
+            return text
+    except ImportError:
+        pass
+
+    raise RuntimeError(
+        "No PDF library found. Run: pip install pdfminer.six  (or pip install PyPDF2)"
+    )
+
+
+def convert_uploaded_files_to_txt(uploaded_files, tmp_input_dir: Path, log_list: list) -> list:
+    """
+    Accept .txt, .docx, and .pdf uploads.
+    .txt files are written as-is.
+    .docx and .pdf files are extracted to .txt and saved with the same stem.
+    Returns a list of Path objects pointing to the .txt files.
+    """
+    txt_paths = []
+    for uf in uploaded_files:
+        raw_bytes = uf.read()
+        suffix = Path(uf.name).suffix.lower()
+        stem   = Path(uf.name).stem
+
+        if suffix == ".txt":
+            out_path = tmp_input_dir / uf.name
+            out_path.write_bytes(raw_bytes)
+            txt_paths.append(out_path)
+            log_list.append(f"[INFO] TXT  → {uf.name}")
+
+        elif suffix == ".docx":
+            try:
+                text = extract_text_from_docx(raw_bytes, uf.name)
+                out_path = tmp_input_dir / f"{stem}.txt"
+                out_path.write_text(text, encoding="utf-8")
+                txt_paths.append(out_path)
+                log_list.append(f"[INFO] DOCX → {uf.name}  ({len(text):,} chars extracted)")
+            except Exception as e:
+                log_list.append(f"[ERROR] DOCX extraction failed for {uf.name}: {e}")
+
+        elif suffix == ".pdf":
+            try:
+                text = extract_text_from_pdf(raw_bytes, uf.name)
+                out_path = tmp_input_dir / f"{stem}.txt"
+                out_path.write_text(text, encoding="utf-8")
+                txt_paths.append(out_path)
+                log_list.append(f"[INFO] PDF  → {uf.name}  ({len(text):,} chars extracted)")
+            except Exception as e:
+                log_list.append(f"[ERROR] PDF extraction failed for {uf.name}: {e}")
+
+        else:
+            log_list.append(f"[WARN] Skipping unsupported file type: {uf.name}")
+
+    return txt_paths
+
+
 # ── Pipeline runner ───────────────────────────────────────────────────
 def run_pipeline_streamlit(uploaded_files, tasks, lang_hint, log_list, output_dir: Path):
     from utils.logger import get_streamlit_logger
@@ -140,14 +231,17 @@ def run_pipeline_streamlit(uploaded_files, tasks, lang_hint, log_list, output_di
     report = PipelineReport(output_dir)
     stage_results = {}
 
+    # ── Convert uploads → plain .txt files ──────────────────────────
     input_dir = output_dir / "input"
     input_dir.mkdir(parents=True, exist_ok=True)
-    input_files = []
-    for uf in uploaded_files:
-        p = input_dir / uf.name
-        p.write_bytes(uf.read())
-        input_files.append(p)
-    log_list.append(f"[INFO] {len(input_files)} input file(s) ready")
+    input_files = convert_uploaded_files_to_txt(uploaded_files, input_dir, log_list)
+
+    if not input_files:
+        log_list.append("[ERROR] No usable input files after extraction — aborting.")
+        return stage_results
+
+    log_list.append(f"[INFO] {len(input_files)} input file(s) ready for pipeline")
+    # ────────────────────────────────────────────────────────────────
 
     current_inputs = input_files
     task_sequence  = [t for t in PIPELINE_ORDER if t in tasks]
@@ -292,7 +386,7 @@ with st.sidebar:
     st.markdown("""
     <div style='font-size:0.72rem;color:#4a7a5e;padding:0.75rem;background:#0a1812;border-radius:8px;line-height:1.7;margin-top:1rem;'>
         <b style='color:#7fb899'>Flow</b><br>
-        OCR .txt → Clean → Detect → Annotate → NER → Semantic → Relations → <b style='color:#c8e6c9'>Consolidate</b> → QA
+        .txt / .docx / .pdf → Extract text → Clean → Detect → Annotate → NER → Semantic → Relations → <b style='color:#c8e6c9'>Consolidate</b> → QA
     </div>
     """, unsafe_allow_html=True)
 
@@ -301,7 +395,7 @@ with st.sidebar:
 st.markdown("""
 <div class="pipeline-header">
     <h1>Ayurveda NLP Pipeline</h1>
-    <p>OCR text → Entities → Relations → Consolidated QA Export · Sanskrit · Malayalam · English · v2</p>
+    <p>Upload TXT · DOCX · PDF → Entities → Relations → Consolidated QA Export · Sanskrit · Malayalam · English · v2</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -315,13 +409,39 @@ tab_run, tab_ner, tab_rel, tab_nlp8, tab_qa = st.tabs([
 # TAB 1 — RUN PIPELINE
 # ════════════════════════════════════════════════════════════════════ #
 with tab_run:
-    st.markdown('<div class="section-title">Upload OCR Text Files</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Upload Files</div>', unsafe_allow_html=True)
+
+    # ── CHANGED: accept txt, docx, and pdf ──────────────────────────
     uploaded = st.file_uploader(
-        "Drop your OCR .txt files here",
-        type=["txt"], accept_multiple_files=True,
+        "Drop your OCR files here (.txt, .docx, .pdf)",
+        type=["txt", "docx", "pdf"],
+        accept_multiple_files=True,
     )
+    # ────────────────────────────────────────────────────────────────
+
     if uploaded:
-        st.success(f"✅  {len(uploaded)} file(s) ready: {', '.join(f.name for f in uploaded)}")
+        # Show a badge per file type so users can see what was detected
+        type_counts = {}
+        for f in uploaded:
+            ext = Path(f.name).suffix.lower().lstrip(".")
+            type_counts[ext] = type_counts.get(ext, 0) + 1
+        badge_str = "  ".join(
+            f'<span style="background:#c8f5d8;color:#1a5c30;padding:2px 9px;border-radius:12px;font-size:0.75rem;font-weight:600;">{cnt} .{ext}</span>'
+            for ext, cnt in sorted(type_counts.items())
+        )
+        st.markdown(
+            f'✅&nbsp; <b>{len(uploaded)}</b> file(s) ready &nbsp;{badge_str}&nbsp; '
+            f'— {", ".join(f.name for f in uploaded)}',
+            unsafe_allow_html=True,
+        )
+
+        # Warn if any PDF/DOCX detected — remind user about required libraries
+        if "pdf" in type_counts or "docx" in type_counts:
+            st.info(
+                "📦 PDF/DOCX files will be converted to plain text before processing. "
+                "Make sure **pdfminer.six** and/or **python-docx** are installed:\n\n"
+                "```\npip install pdfminer.six python-docx\n```"
+            )
 
     col_btn, _ = st.columns([1, 3])
     with col_btn:
