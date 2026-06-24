@@ -1,25 +1,44 @@
 """
-NLP-07: Relationship Mining  [FIXED v3]
+NLP-07: Relationship Mining  [FIXED v4]
 =========================================
-ROOT CAUSE OF "No relations found":
-  load_entities() searched for 3 hard-coded directory names — all WRONG:
-    ✗ nlp_06_semantic_tagging_semantic_assignments
-    ✗ nlp_05_entity_recognition_ner_model_training
-    ✗ nlp_03_annotation_annotation_guideline_creation
+What changed vs v3 (and why):
 
-  Actual names created by app.py/run_pipeline.py:
-    ✓ nlp_06_semantic_tagging
-    ✓ nlp_05_ner_training
-    ✓ nlp_03_annotation
+  PROBLEM (v3): `_read_text()` only handled two cases — the input file is
+  already a .txt, or a single `rglob(stem + ".txt")` lookup. By the time
+  NLP-07 runs, `current_inputs` are the JSON outputs of NLP-06, so it
+  always falls into the rglob branch. If any earlier stage renamed the
+  stem (e.g. a cleaning stage appending "_clean"), the rglob finds
+  nothing and `text` silently becomes "". Proximity-based relations then
+  extract zero results with no warning the user can act on, and
+  co-occurrence relations (which also need `text` for sentence
+  splitting) degrade to nothing as well.
 
-  FIX: replaced all hard-coded paths with rglob() on the pipeline root.
-       Works correctly regardless of how directories are named now or in future.
+  FIX (v4):
+    1. _read_text() now searches in priority order:
+         a. the file itself, if already .txt
+         b. output_dir.parent/"input"/{stem}.txt   (the original
+            extracted text — always present, never renamed, written
+            directly by app.py's convert_uploaded_files_to_txt)
+         c. NLP-01's output directory, matched by glob on stage name
+            rather than a hard-coded path
+         d. a broad rglob(f"{stem}*.txt") fallback that collects every
+            candidate and keeps the longest (most complete) one instead
+            of just "whichever rglob finds first"
+       If nothing is found anywhere, it logs a specific warning naming
+       the stem and the directory tree searched, instead of failing
+       silently.
 
-Other improvements kept from v2:
-  - Real confidence scoring (high/medium/low)
-  - Trigger word strength taxonomy
-  - Deduplication with best-confidence merge
-  - Confidence breakdown in summary
+    2. cooccurrence_relations() now has a real fallback path
+       (_cooccurrence_by_position) for when no source text exists at
+       all: it sorts entities by character offset and groups ones close
+       together by position instead of needing sentence boundaries from
+       `text`. So even in the worst case (text genuinely unrecoverable)
+       you still get low-confidence CO_OCCURS_WITH relations instead of
+       zero relations.
+
+  Everything else (entity loading via rglob across nlp_03/05/06 output,
+  confidence scoring, trigger taxonomy, dedup) is unchanged from v3 —
+  those parts were already correct.
 
 Deliverable: NLP, Dependency Parsing
 """
@@ -119,6 +138,7 @@ RELATION_PATTERNS = [
 ]
 
 PROXIMITY_WINDOW = 350
+COOCCUR_POSITION_WINDOW = 200  # used only by the text-less fallback
 CONF_RANK = {"high": 3, "medium": 2, "low": 1, "": 0}
 
 
@@ -150,11 +170,10 @@ class RelationshipExtractor:
 
     def load_entities(self, source_stem: str) -> list:
         """
-        FIX: All 3 hard-coded directory names were wrong.
-        Now uses rglob on the pipeline root — finds entity files regardless
-        of what directory they live in.
-
-        Priority: semantic > NER > annotated (most enriched first)
+        Uses rglob on the pipeline root — finds entity files regardless
+        of what directory they live in. Priority: semantic > NER > annotated
+        (most enriched first). Supports entities under any of the three
+        key names different upstream stages use.
         """
         pipeline_root = self.output_dir.parent
 
@@ -192,17 +211,88 @@ class RelationshipExtractor:
         return stem
 
     def _read_text(self, f: Path, stem: str) -> str:
-        """Read source text. Input may be .json or .txt."""
+        """
+        Locate the best available source text for `stem`.
+
+        Search order (stops at first non-empty result):
+          1. `f` itself, if it's already a .txt file
+          2. output_dir.parent/"input"/{stem}.txt — the original
+             extracted text written by app.py before any NLP stage runs.
+             This is the most reliable source: it's never renamed and
+             always exists if the pipeline started correctly.
+          3. NLP-01's output directory (matched by glob on the stage
+             name pattern "nlp_01*", not a hard-coded path) — covers the
+             case where cleaning meaningfully changed the text and we'd
+             rather extract relations from the cleaned version.
+          4. A broad rglob(f"{stem}*.txt") across the whole pipeline
+             output tree. If multiple files match (e.g. stale dirs from
+             a previous run, or a stage that appended a suffix to the
+             stem), keep the longest one rather than an arbitrary first
+             match.
+
+        If nothing is found, logs a specific warning and returns "" so
+        callers can fall back to position-based co-occurrence instead
+        of failing silently.
+        """
         if f.suffix == ".txt":
-            return f.read_text(encoding="utf-8", errors="replace")
-        # Search for original .txt in pipeline root
-        for txt in self.output_dir.parent.rglob(stem + ".txt"):
-            return txt.read_text(encoding="utf-8", errors="replace")
+            try:
+                text = f.read_text(encoding="utf-8", errors="replace")
+                if text.strip():
+                    return text
+            except Exception:
+                pass
+
+        pipeline_root = self.output_dir.parent
+
+        # 2. Original extracted input text
+        input_txt = pipeline_root / "input" / f"{stem}.txt"
+        if input_txt.exists():
+            try:
+                text = input_txt.read_text(encoding="utf-8", errors="replace")
+                if text.strip():
+                    return text
+            except Exception:
+                pass
+
+        # 3. NLP-01 cleaned text, wherever its output dir is actually named
+        for nlp01_dir in pipeline_root.glob("nlp_01*"):
+            if not nlp01_dir.is_dir():
+                continue
+            for cleaned in nlp01_dir.rglob("*.txt"):
+                if cleaned.stem == stem or cleaned.stem.startswith(stem):
+                    try:
+                        text = cleaned.read_text(encoding="utf-8", errors="replace")
+                        if text.strip():
+                            return text
+                    except Exception:
+                        continue
+
+        # 4. Broad fallback — collect every candidate, keep the longest
+        candidates = []
+        for txt in pipeline_root.rglob(f"{stem}*.txt"):
+            try:
+                content = txt.read_text(encoding="utf-8", errors="replace")
+                if content.strip():
+                    candidates.append(content)
+            except Exception:
+                continue
+        if candidates:
+            return max(candidates, key=len)
+
+        self.logger.warning(
+            f"  NLP-07: could not locate source text for stem '{stem}' "
+            f"anywhere under {pipeline_root} — proximity relations will be "
+            "skipped for this file; falling back to position-based "
+            "co-occurrence (lower quality, confidence='low' only)."
+        )
         return ""
 
     # ── Relation extraction ───────────────────────────────────────────
 
     def proximity_relations(self, entities: list, text: str) -> list:
+        if not text:
+            return []  # nothing to pattern-match against; caller handles fallback
+
         relations = []
         for i, ent_a in enumerate(entities):
             for ent_b in entities[i + 1:]:
@@ -258,6 +348,9 @@ class RelationshipExtractor:
         return relations
 
     def cooccurrence_relations(self, entities: list, text: str) -> list:
+        if not text:
+            return self._cooccurrence_by_position(entities)
+
         boundaries = [0]
         for m in re.finditer(r"[।\.!\?]\s+", text):
             boundaries.append(m.end())
@@ -284,6 +377,37 @@ class RelationshipExtractor:
                         "char_distance":    abs(ea.get("start",0) - eb.get("start",0)),
                         "context":          text[s_start:s_end][:120],
                         "extraction_method": "cooccurrence",
+                    })
+        return relations
+
+    def _cooccurrence_by_position(self, entities: list,
+                                   window: int = COOCCUR_POSITION_WINDOW) -> list:
+        """
+        Fallback used only when no source text could be located at all.
+        Groups entities that are close together by character offset
+        (start/end, as recorded by upstream NER) instead of relying on
+        sentence boundaries from `text`. Always confidence='low' — this
+        is a last resort, not a substitute for real sentence context.
+        """
+        relations = []
+        sorted_ents = sorted(entities, key=lambda e: e.get("start", 0))
+        for i, ea in enumerate(sorted_ents):
+            for eb in sorted_ents[i + 1:]:
+                gap = eb.get("start", 0) - ea.get("end", 0)
+                if gap > window:
+                    break  # sorted by start, so nothing further will be closer
+                if ea.get("label") != eb.get("label"):
+                    relations.append({
+                        "relation":         "CO_OCCURS_WITH",
+                        "subject":          ea["text"],
+                        "subject_label":    ea.get("label", ""),
+                        "object":           eb["text"],
+                        "object_label":     eb.get("label", ""),
+                        "confidence":       "low",
+                        "trigger_strength": "low",
+                        "char_distance":    max(0, gap),
+                        "context":          "",
+                        "extraction_method": "cooccurrence_position_fallback",
                     })
         return relations
 
