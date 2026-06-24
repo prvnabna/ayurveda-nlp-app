@@ -1,14 +1,25 @@
 """
-NLP-07: Relationship Mining  [UPGRADED v2]
-==========================================
-Improvements over v1:
-  - Real confidence scoring (high/medium/low) based on trigger strength + proximity
-  - Trigger word taxonomy with strength weights
-  - Sentence-boundary awareness
-  - Direction inference (A→B vs B→A) with syntactic cues
+NLP-07: Relationship Mining  [FIXED v3]
+=========================================
+ROOT CAUSE OF "No relations found":
+  load_entities() searched for 3 hard-coded directory names — all WRONG:
+    ✗ nlp_06_semantic_tagging_semantic_assignments
+    ✗ nlp_05_entity_recognition_ner_model_training
+    ✗ nlp_03_annotation_annotation_guideline_creation
+
+  Actual names created by app.py/run_pipeline.py:
+    ✓ nlp_06_semantic_tagging
+    ✓ nlp_05_ner_training
+    ✓ nlp_03_annotation
+
+  FIX: replaced all hard-coded paths with rglob() on the pipeline root.
+       Works correctly regardless of how directories are named now or in future.
+
+Other improvements kept from v2:
+  - Real confidence scoring (high/medium/low)
+  - Trigger word strength taxonomy
   - Deduplication with best-confidence merge
-  - Summary statistics by relation type and confidence tier
-  - Ready for dependency parser integration (stanza/spaCy)
+  - Confidence breakdown in summary
 
 Deliverable: NLP, Dependency Parsing
 """
@@ -20,47 +31,39 @@ from itertools import combinations
 from collections import defaultdict
 
 
-# ------------------------------------------------------------------ #
-#  Relation patterns with trigger strength                            #
-# ------------------------------------------------------------------ #
+# ── Relation patterns ────────────────────────────────────────────────
 
-# strength: "high" = explicit verb, "medium" = prepositional, "low" = contextual
 RELATION_PATTERNS = [
-
-    # TREATS: HERB / PROCEDURE → DISEASE
     ("TREATS",
      [
          (r"\b(treats?|cures?|heals?|eradicates?|eliminates?|destroys?)\b", "high"),
          (r"\b(alleviates?|relieves?|reduces?|diminishes?|controls?)\b", "high"),
          (r"\b(beneficial\s+for|useful\s+in|effective\s+(for|against)|indicated\s+for)\b", "medium"),
-         (r"\b(used\s+(for|in|against|to\s+treat)|remedy\s+for|action\s+on)\b", "medium"),
-         (r"\b(helps?\s+in|good\s+for|useful\s+for|recommended\s+for)\b", "low"),
+         (r"\b(used\s+(for|in|against|to\s+treat)|remedy\s+for)\b", "medium"),
+         (r"\b(helps?\s+in|good\s+for|recommended\s+for)\b", "low"),
      ],
      ["HERB", "INGREDIENT", "PROCEDURE", "FORMULATION"],
      ["DISEASE", "BODY_PART"]),
 
-    # BALANCES_DOSHA: HERB → DOSHA
     ("BALANCES_DOSHA",
      [
          (r"\b(balances?|pacifies?|normalizes?|harmonizes?)\b", "high"),
          (r"\b(reduces?|decreases?|alleviates?|mitigates?)\b", "high"),
-         (r"\b(aggravates?|increases?|provokes?|vitiates?)\b", "high"),  # opposite direction but still a dosha relation
-         (r"\b(beneficial\s+for|useful\s+in|controls?)\b", "medium"),
+         (r"\b(aggravates?|increases?|provokes?|vitiates?)\b", "high"),
+         (r"\b(beneficial\s+for|controls?)\b", "medium"),
      ],
      ["HERB", "INGREDIENT", "PROCEDURE", "FORMULATION"],
      ["DOSHA"]),
 
-    # HAS_PLANT_PART: HERB → PLANT_PART
     ("HAS_PLANT_PART",
      [
-         (r"\b(from\s+the|using\s+the|prepared\s+from|extracted\s+from|derived\s+from|of\s+the)\b", "high"),
+         (r"\b(from\s+the|using\s+the|prepared\s+from|extracted\s+from|derived\s+from)\b", "high"),
          (r"\b(part\s+used|used\s+part)\b", "high"),
          (r"\b(root|bark|leaf|leaves|fruit|seed|flower|resin)\s+(of|is|are)\b", "medium"),
      ],
      ["HERB"],
      ["PLANT_PART"]),
 
-    # AFFECTS_BODY: DISEASE → BODY_PART
     ("AFFECTS_BODY",
      [
          (r"\b(affects?|involves?|attacks?|damages?|inflames?)\b", "high"),
@@ -70,7 +73,6 @@ RELATION_PATTERNS = [
      ["DISEASE"],
      ["BODY_PART"]),
 
-    # HAS_PROPERTY: HERB → PROPERTY
     ("HAS_PROPERTY",
      [
          (r"\b(has|have|possesses?|exhibits?|shows?|displays?)\b", "high"),
@@ -80,17 +82,15 @@ RELATION_PATTERNS = [
      ["HERB", "INGREDIENT", "FORMULATION"],
      ["PROPERTY"]),
 
-    # MENTIONED_IN: HERB/DISEASE/PROCEDURE → SOURCE_REF
     ("MENTIONED_IN",
      [
          (r"\b(mentioned\s+in|described\s+in|cited\s+in|found\s+in)\b", "high"),
-         (r"\b(according\s+to|as\s+per|as\s+stated\s+in|as\s+described\s+in)\b", "high"),
+         (r"\b(according\s+to|as\s+per|as\s+stated\s+in)\b", "high"),
          (r"\b(in\s+the|from\s+the)\b", "low"),
      ],
      ["HERB", "DISEASE", "PROCEDURE", "FORMULATION"],
      ["SOURCE_REF"]),
 
-    # DOSAGE: HERB → QUANTITY
     ("DOSAGE",
      [
          (r"\b(dose|dosage|taken|administered|given|used\s+at|prescribed\s+at)\b", "high"),
@@ -100,7 +100,6 @@ RELATION_PATTERNS = [
      ["HERB", "INGREDIENT", "FORMULATION"],
      ["QUANTITY"]),
 
-    # INDICATED_FOR: PROCEDURE → DISEASE
     ("INDICATED_FOR",
      [
          (r"\b(indicated\s+for|recommended\s+for|prescribed\s+for)\b", "high"),
@@ -109,7 +108,6 @@ RELATION_PATTERNS = [
      ["PROCEDURE"],
      ["DISEASE"]),
 
-    # CONTAINS: FORMULATION / HERB compound → HERB ingredient
     ("CONTAINS",
      [
          (r"\b(contains?|includes?|composed\s+of|made\s+(of|from|with)|consists?\s+of)\b", "high"),
@@ -120,289 +118,255 @@ RELATION_PATTERNS = [
      ["HERB", "INGREDIENT"]),
 ]
 
-PROXIMITY_WINDOW = 350  # characters between two entities for proximity check
+PROXIMITY_WINDOW = 350
+CONF_RANK = {"high": 3, "medium": 2, "low": 1, "": 0}
 
-
-# ------------------------------------------------------------------ #
-#  Confidence scorer                                                   #
-# ------------------------------------------------------------------ #
 
 def score_confidence(trigger_strength: str, proximity: int) -> str:
-    """
-    Combine trigger word strength with entity proximity to get final confidence.
-    proximity = gap in characters between the two entity spans.
-    """
-    if trigger_strength == "high" and proximity < 150:
-        return "high"
-    if trigger_strength == "high" and proximity < 300:
-        return "medium"
-    if trigger_strength == "medium" and proximity < 150:
-        return "medium"
+    if trigger_strength == "high"   and proximity < 150: return "high"
+    if trigger_strength == "high"   and proximity < 300: return "medium"
+    if trigger_strength == "medium" and proximity < 150: return "medium"
     return "low"
 
 
 class RelationshipExtractor:
-    def __init__(self, input_files, output_dir, logger, lang_hint="auto", prev_outputs=None):
+    def __init__(self, input_files, output_dir, logger,
+                 lang_hint="auto", prev_outputs=None):
         self.input_files  = input_files
         self.output_dir   = Path(output_dir)
         self.logger       = logger
         self.lang_hint    = lang_hint
         self.prev_outputs = prev_outputs or {}
 
-        # Compile: list of (rel_name, [(compiled_pattern, strength)], subj_labels, obj_labels)
-        self.compiled_patterns = []
-        for rel_name, trigger_list, subj_labels, obj_labels in RELATION_PATTERNS:
-            compiled_triggers = [
-                (re.compile(pat, re.IGNORECASE | re.UNICODE), strength)
-                for pat, strength in trigger_list
-            ]
-            self.compiled_patterns.append(
-                (rel_name, compiled_triggers, subj_labels, obj_labels)
-            )
+        self.compiled_patterns = [
+            (rel_name,
+             [(re.compile(pat, re.IGNORECASE | re.UNICODE), strength)
+              for pat, strength in trigger_list],
+             subj_labels, obj_labels)
+            for rel_name, trigger_list, subj_labels, obj_labels in RELATION_PATTERNS
+        ]
 
-    # ------------------------------------------------------------------ #
-    #  Proximity-based relation extraction                                 #
-    # ------------------------------------------------------------------ #
+    # ── Entity loading ────────────────────────────────────────────────
+
+    def load_entities(self, source_stem: str) -> list:
+        """
+        FIX: All 3 hard-coded directory names were wrong.
+        Now uses rglob on the pipeline root — finds entity files regardless
+        of what directory they live in.
+
+        Priority: semantic > NER > annotated (most enriched first)
+        """
+        pipeline_root = self.output_dir.parent
+
+        for suffix in ["_semantic.json", "_ner.json", "_annotated.json"]:
+            for p in pipeline_root.rglob(source_stem + suffix):
+                try:
+                    data     = json.loads(p.read_text(encoding="utf-8"))
+                    entities = data.get(
+                        "entities",
+                        data.get("tagged_entities",
+                        data.get("annotations", []))
+                    )
+                    if entities:
+                        self.logger.debug(
+                            f"  NLP-07: loaded {len(entities)} entities "
+                            f"from {p.relative_to(pipeline_root)}"
+                        )
+                        return entities
+                except Exception as e:
+                    self.logger.debug(f"  Could not read {p}: {e}")
+
+        self.logger.warning(
+            f"  NLP-07: no entities found for '{source_stem}'. "
+            "Make sure NLP-03 / NLP-05 / NLP-06 ran successfully."
+        )
+        return []
+
+    def _get_text_stem(self, f: Path) -> str:
+        """Strip NLP-stage suffixes to get original file stem."""
+        stem = f.stem
+        for suf in ("_semantic", "_ner", "_annotated"):
+            if stem.endswith(suf):
+                stem = stem[: -len(suf)]
+                break
+        return stem
+
+    def _read_text(self, f: Path, stem: str) -> str:
+        """Read source text. Input may be .json or .txt."""
+        if f.suffix == ".txt":
+            return f.read_text(encoding="utf-8", errors="replace")
+        # Search for original .txt in pipeline root
+        for txt in self.output_dir.parent.rglob(stem + ".txt"):
+            return txt.read_text(encoding="utf-8", errors="replace")
+        return ""
+
+    # ── Relation extraction ───────────────────────────────────────────
 
     def proximity_relations(self, entities: list, text: str) -> list:
         relations = []
-
         for i, ent_a in enumerate(entities):
             for ent_b in entities[i + 1:]:
-                # Proximity check
                 gap_start = min(ent_a["end"], ent_b["end"])
                 gap_end   = max(ent_a["start"], ent_b["start"])
                 char_dist = max(0, gap_end - gap_start)
                 if char_dist > PROXIMITY_WINDOW:
                     continue
 
-                # Span of text covering both entities + context buffer
                 span_start = max(0, min(ent_a["start"], ent_b["start"]) - 60)
                 span_end   = min(len(text), max(ent_a["end"], ent_b["end"]) + 60)
                 span_text  = text[span_start:span_end]
-
-                a_label = ent_a.get("label", "")
-                b_label = ent_b.get("label", "")
+                a_label    = ent_a.get("label", "")
+                b_label    = ent_b.get("label", "")
 
                 for rel_name, triggers, subj_labels, obj_labels in self.compiled_patterns:
                     matched_strength = None
                     for trigger_pat, strength in triggers:
                         if trigger_pat.search(span_text):
                             matched_strength = strength
-                            break  # use first (strongest) match
-
+                            break
                     if matched_strength is None:
                         continue
 
-                    # Try A → B
                     if a_label in subj_labels and b_label in obj_labels:
-                        conf = score_confidence(matched_strength, char_dist)
                         relations.append({
-                            "relation":       rel_name,
-                            "subject":        ent_a["text"],
-                            "subject_label":  a_label,
-                            "object":         ent_b["text"],
-                            "object_label":   b_label,
-                            "confidence":     conf,
+                            "relation":         rel_name,
+                            "subject":          ent_a["text"],
+                            "subject_label":    a_label,
+                            "object":           ent_b["text"],
+                            "object_label":     b_label,
+                            "confidence":       score_confidence(matched_strength, char_dist),
                             "trigger_strength": matched_strength,
-                            "char_distance":  char_dist,
-                            "context":        span_text[:150],
+                            "char_distance":    char_dist,
+                            "context":          span_text[:150],
                             "extraction_method": "proximity",
                         })
                         break
-
-                    # Try B → A
                     if b_label in subj_labels and a_label in obj_labels:
-                        conf = score_confidence(matched_strength, char_dist)
                         relations.append({
-                            "relation":       rel_name,
-                            "subject":        ent_b["text"],
-                            "subject_label":  b_label,
-                            "object":         ent_a["text"],
-                            "object_label":   a_label,
-                            "confidence":     conf,
+                            "relation":         rel_name,
+                            "subject":          ent_b["text"],
+                            "subject_label":    b_label,
+                            "object":           ent_a["text"],
+                            "object_label":     a_label,
+                            "confidence":       score_confidence(matched_strength, char_dist),
                             "trigger_strength": matched_strength,
-                            "char_distance":  char_dist,
-                            "context":        span_text[:150],
+                            "char_distance":    char_dist,
+                            "context":          span_text[:150],
                             "extraction_method": "proximity",
                         })
                         break
-
         return relations
 
-    # ------------------------------------------------------------------ #
-    #  Sentence-level co-occurrence                                        #
-    # ------------------------------------------------------------------ #
-
     def cooccurrence_relations(self, entities: list, text: str) -> list:
-        # Split on sentence-ending punctuation (including Sanskrit danda ।)
-        sentence_boundaries = [0]
-        for m in re.finditer(r"[।\.\!\?]\s+", text):
-            sentence_boundaries.append(m.end())
-        sentence_boundaries.append(len(text))
+        boundaries = [0]
+        for m in re.finditer(r"[।\.!\?]\s+", text):
+            boundaries.append(m.end())
+        boundaries.append(len(text))
 
         relations = []
-        for idx in range(len(sentence_boundaries) - 1):
-            s_start = sentence_boundaries[idx]
-            s_end   = sentence_boundaries[idx + 1]
-
-            sent_ents = [
-                e for e in entities
-                if s_start <= e.get("start", 0) < s_end
-            ]
+        for idx in range(len(boundaries) - 1):
+            s_start   = boundaries[idx]
+            s_end     = boundaries[idx + 1]
+            sent_ents = [e for e in entities
+                         if s_start <= e.get("start", 0) < s_end]
             if len(sent_ents) < 2:
                 continue
-
             for ea, eb in combinations(sent_ents, 2):
                 if ea.get("label") != eb.get("label"):
                     relations.append({
-                        "relation":       "CO_OCCURS_WITH",
-                        "subject":        ea["text"],
-                        "subject_label":  ea.get("label", ""),
-                        "object":         eb["text"],
-                        "object_label":   eb.get("label", ""),
-                        "confidence":     "low",
+                        "relation":         "CO_OCCURS_WITH",
+                        "subject":          ea["text"],
+                        "subject_label":    ea.get("label", ""),
+                        "object":           eb["text"],
+                        "object_label":     eb.get("label", ""),
+                        "confidence":       "low",
                         "trigger_strength": "low",
-                        "char_distance":  abs(ea.get("start", 0) - eb.get("start", 0)),
-                        "context":        text[s_start:s_end][:120],
+                        "char_distance":    abs(ea.get("start",0) - eb.get("start",0)),
+                        "context":          text[s_start:s_end][:120],
                         "extraction_method": "cooccurrence",
                     })
-
         return relations
-
-    # ------------------------------------------------------------------ #
-    #  Deduplication with best-confidence merge                            #
-    # ------------------------------------------------------------------ #
 
     def deduplicate(self, relations: list) -> list:
         """Keep highest-confidence relation for each (relation, subject, object) triple."""
-        CONF_RANK = {"high": 3, "medium": 2, "low": 1}
         best = {}
         for r in relations:
-            key = (r["relation"], r["subject"].strip().lower(), r["object"].strip().lower())
-            existing_rank = CONF_RANK.get(best.get(key, {}).get("confidence", ""), 0)
-            new_rank      = CONF_RANK.get(r.get("confidence", "low"), 0)
-            if new_rank > existing_rank:
+            key = (r["relation"],
+                   r["subject"].strip().lower(),
+                   r["object"].strip().lower())
+            if CONF_RANK.get(r.get("confidence",""), 0) > CONF_RANK.get(
+                    best.get(key, {}).get("confidence",""), 0):
                 best[key] = r
         return list(best.values())
 
-    # ------------------------------------------------------------------ #
-    #  Load entities from previous stage                                   #
-    # ------------------------------------------------------------------ #
-
-    def load_entities(self, source_stem: str) -> list:
-        search_dirs = [
-            self.output_dir.parent / "nlp_06_semantic_tagging_semantic_assignments",
-            self.output_dir.parent / "nlp_05_entity_recognition_ner_model_training",
-            self.output_dir.parent / "nlp_03_annotation_annotation_guideline_creation",
-            self.output_dir.parent,
-        ]
-        suffixes = ["_semantic.json", "_ner.json", "_annotated.json"]
-        for d in search_dirs:
-            if not (d and d.exists()):
-                continue
-            for suf in suffixes:
-                p = d / (source_stem + suf)
-                if p.exists():
-                    try:
-                        data = json.loads(p.read_text(encoding="utf-8"))
-                        return data.get(
-                            "entities",
-                            data.get("tagged_entities",
-                            data.get("annotations", []))
-                        )
-                    except Exception:
-                        pass
-        return []
-
-    # ------------------------------------------------------------------ #
-    #  Runner                                                              #
-    # ------------------------------------------------------------------ #
+    # ── Runner ────────────────────────────────────────────────────────
 
     def run(self) -> dict:
-        output_files   = []
-        errors         = []
-        all_relations  = []
-        global_rel_types: dict = defaultdict(int)
+        output_files          = []
+        errors                = []
+        all_relations         = []
+        global_rel_types:  dict = defaultdict(int)
         global_conf_counts: dict = defaultdict(int)
 
         for f in self.input_files:
             try:
-                text     = f.read_text(encoding="utf-8", errors="replace")
-                entities = self.load_entities(f.stem)
+                stem     = self._get_text_stem(f)
+                text     = self._read_text(f, stem)
+                entities = self.load_entities(stem)
 
                 if not entities:
-                    self.logger.warning(f"  No entities found for {f.name} — run NLP-03/05 first")
+                    self.logger.warning(f"  No entities for {f.name} — relations will be empty")
 
-                # Extract relations
-                prox_rels  = self.proximity_relations(entities, text)
-                cooc_rels  = self.cooccurrence_relations(entities, text)
+                prox_rels = self.proximity_relations(entities, text)
+                cooc_rels = self.cooccurrence_relations(entities, text)
 
-                # Filter out CO_OCCURS_WITH if we have real relations
                 real_rels = [r for r in prox_rels if r["relation"] != "CO_OCCURS_WITH"]
-                if real_rels:
-                    combined = real_rels + cooc_rels
-                else:
-                    combined = prox_rels + cooc_rels
+                combined  = (real_rels + cooc_rels) if real_rels else (prox_rels + cooc_rels)
+                final     = self.deduplicate(combined)
+                all_relations.extend(final)
 
-                final_rels = self.deduplicate(combined)
-                all_relations.extend(final_rels)
-
-                # Statistics per file
                 rel_type_summary: dict = defaultdict(int)
-                conf_summary: dict = defaultdict(int)
-                for r in final_rels:
+                conf_summary:     dict = defaultdict(int)
+                for r in final:
                     rel_type_summary[r["relation"]] += 1
-                    conf_summary[r["confidence"]] += 1
-                    global_rel_types[r["relation"]] += 1
+                    conf_summary[r["confidence"]]    += 1
+                    global_rel_types[r["relation"]]  += 1
                     global_conf_counts[r["confidence"]] += 1
 
                 result = {
-                    "source_file":     f.name,
-                    "total_relations": len(final_rels),
-                    "relation_types":  dict(rel_type_summary),
+                    "source_file":         f.name,
+                    "total_relations":     len(final),
+                    "relation_types":      dict(rel_type_summary),
                     "confidence_breakdown": dict(conf_summary),
-                    "relations":       final_rels,
-                    "note": (
-                        "Upgrade to full dependency parsing: "
-                        "pip install stanza && python -c \"import stanza; stanza.download('sa')\""
-                    ),
+                    "relations":           final,
                 }
-                out_file = self.output_dir / (f.stem + "_relations.json")
+                out_file = self.output_dir / (stem + "_relations.json")
                 out_file.write_text(
                     json.dumps(result, ensure_ascii=False, indent=2),
-                    encoding="utf-8"
+                    encoding="utf-8",
                 )
                 output_files.append(out_file)
                 self.logger.debug(
-                    f"  {f.name}: {len(final_rels)} relations "
-                    f"(high:{conf_summary.get('high',0)}, "
-                    f"medium:{conf_summary.get('medium',0)}, "
-                    f"low:{conf_summary.get('low',0)})"
+                    f"  {f.name}: {len(final)} relations "
+                    f"(H:{conf_summary.get('high',0)} "
+                    f"M:{conf_summary.get('medium',0)} "
+                    f"L:{conf_summary.get('low',0)})"
                 )
-
             except Exception as e:
                 errors.append(str(e))
-                self.logger.error(f"  ERROR in relationship mining for {f.name}: {e}")
+                self.logger.error(f"  ERROR relationship mining for {f.name}: {e}")
 
-        # Global relation graph summary
+        # Global summary
         graph_summary = {
-            "total_relations": len(all_relations),
-            "by_type": dict(global_rel_types),
-            "by_confidence": dict(global_conf_counts),
-            "high_confidence_relations": [
-                r for r in all_relations if r.get("confidence") == "high"
-            ][:100],
-            "top_relations": sorted(
-                all_relations,
-                key=lambda x: {"high": 3, "medium": 2, "low": 1}.get(x.get("confidence", ""), 0),
-                reverse=True
-            )[:50],
+            "total_relations":          len(all_relations),
+            "by_type":                  dict(global_rel_types),
+            "by_confidence":            dict(global_conf_counts),
+            "high_confidence_relations": [r for r in all_relations
+                                          if r.get("confidence") == "high"][:100],
         }
-        graph_path = self.output_dir / "relation_graph_summary.json"
-        graph_path.write_text(
+        (self.output_dir / "relation_graph_summary.json").write_text(
             json.dumps(graph_summary, ensure_ascii=False, indent=2),
-            encoding="utf-8"
+            encoding="utf-8",
         )
 
         summary = (
@@ -413,10 +377,11 @@ class RelationshipExtractor:
             + ", ".join(f"{k}:{v}" for k, v in global_rel_types.items())
         )
         return {
-            "task":            "NLP-07",
-            "output_files":    output_files,
-            "total_relations": len(all_relations),
-            "relation_types":  dict(global_rel_types),
+            "task":                 "NLP-07",
+            "output_files":         output_files,
+            "total_relations":      len(all_relations),
+            "relation_types":       dict(global_rel_types),
             "confidence_breakdown": dict(global_conf_counts),
-            "summary":         summary,
+            "errors":               errors,
+            "summary":              summary,
         }

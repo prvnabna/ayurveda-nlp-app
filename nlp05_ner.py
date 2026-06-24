@@ -1,13 +1,19 @@
 """
-NLP-05: NER Model Training — Named Entity Recognition for Ayurveda
-===================================================================
-Trains or runs a NER model for Ayurveda entities.
-Uses spaCy (fast, CPU) with optional HuggingFace transformer backbone.
+NLP-05: NER Model Training  [FIXED v3]
+=======================================
+BUG FIXES:
+  1. load_training_data() searched for 'nlp_03_annotation_annotation_guideline_creation'
+     — directory does not exist.  Now uses rglob("*_annotated.json") which finds
+     annotation files regardless of what the parent folder is named.
+  2. output_files still appended 'f' (original .txt) instead of 'out_file' (NER .json).
+     Fixed — NLP-06 and NLP-07 can now locate NER output via rglob too.
+  3. Regex-based fallback NER so entities are always produced even without spaCy.
 
 Deliverable: spaCy, Transformers
 """
 
 import json
+import re
 import random
 from pathlib import Path
 
@@ -20,94 +26,120 @@ except ImportError:
     SPACY_AVAILABLE = False
 
 try:
-    from transformers import (
-        AutoTokenizer, AutoModelForTokenClassification,
-        pipeline as hf_pipeline
-    )
+    from transformers import AutoTokenizer, AutoModelForTokenClassification
     TRANSFORMERS_AVAILABLE = True
 except ImportError:
     TRANSFORMERS_AVAILABLE = False
 
 
-# Labels matching NLP-03 annotation schema
 NER_LABELS = [
     "HERB", "DOSHA", "DISEASE", "PROCEDURE",
     "BODY_PART", "INGREDIENT", "QUANTITY",
-    "SOURCE_REF", "PLANT_PART", "PROPERTY",
+    "SOURCE_REF", "PLANT_PART", "PROPERTY", "FORMULATION", "DIET",
 ]
 
-# Multilingual models suitable for Sanskrit/Malayalam/English
 RECOMMENDED_MODELS = {
-    "multilingual": "ai4bharat/indic-bert",       # Best for Indic langs
-    "english":      "en_core_web_sm",              # spaCy English
-    "lightweight":  "bert-base-multilingual-cased" # Fallback
+    "multilingual_indic": "ai4bharat/indic-bert",
+    "multilingual_base":  "bert-base-multilingual-cased",
+    "english_light":      "en_core_web_sm",
 }
+
+MIN_TRAINING_DOCS = 3
 
 
 class NERModelTrainer:
-    def __init__(self, input_files, output_dir, logger, lang_hint="auto", prev_outputs=None):
+    def __init__(self, input_files, output_dir, logger,
+                 lang_hint="auto", prev_outputs=None):
         self.input_files  = input_files
         self.output_dir   = Path(output_dir)
         self.logger       = logger
         self.lang_hint    = lang_hint
         self.prev_outputs = prev_outputs or {}
 
-    # ------------------------------------------------------------------ #
-    #  Data loading from NLP-03 annotations                               #
-    # ------------------------------------------------------------------ #
+    # ── Training data ────────────────────────────────────────────────
 
-    def load_training_data(self):
-        """Load annotated spans from NLP-03 output."""
+    def load_training_data(self) -> list:
+        """
+        FIX: was searching hard-coded directory name 'nlp_03_annotation_annotation_guideline_creation'
+        which never exists. Now uses rglob('*_annotated.json') on the pipeline root,
+        which finds annotation files in ANY subdirectory regardless of naming.
+        """
         training = []
+        pipeline_root = self.output_dir.parent
 
-        # Look for NLP-03 output in prev stage
-        nlp03_dir = None
-        for task_num, result in self.prev_outputs.items():
-            if result.get("task") == "NLP-03":
-                # output_files from NLP-03 are the cleaned text files,
-                # annotation JSONs are in the NLP-03 output dir
-                if result.get("output_files"):
-                    sample = result["output_files"][0]
-                    nlp03_dir = sample.parent.parent / "nlp_03_annotation_annotation_guideline_creation"
-                break
+        for ann_file in pipeline_root.rglob("*_annotated.json"):
+            try:
+                data     = json.loads(ann_file.read_text(encoding="utf-8"))
+                text     = data.get("text", "")
+                spans    = data.get("annotations", [])
+                entities = [(s["start"], s["end"], s["label"]) for s in spans
+                            if s.get("label") in NER_LABELS]
+                if text and entities:
+                    training.append((text, {"entities": entities}))
+            except Exception as e:
+                self.logger.debug(f"  Skipping {ann_file.name}: {e}")
 
-        # Try to find annotation JSONs
-        ann_dirs = [nlp03_dir] if nlp03_dir else []
-        ann_dirs.append(self.output_dir.parent)  # also search sibling dirs
-
-        for search_dir in ann_dirs:
-            if search_dir and search_dir.exists():
-                for ann_file in search_dir.glob("*_annotated.json"):
-                    try:
-                        data = json.loads(ann_file.read_text(encoding="utf-8"))
-                        text = data.get("text", "")
-                        spans = data.get("annotations", [])
-                        entities = [(s["start"], s["end"], s["label"]) for s in spans]
-                        if text and entities:
-                            training.append((text, {"entities": entities}))
-                    except Exception:
-                        pass
-
+        self.logger.info(f"  NLP-05: {len(training)} annotated docs found for training")
         return training
 
-    # ------------------------------------------------------------------ #
-    #  spaCy NER                                                           #
-    # ------------------------------------------------------------------ #
+    # ── Regex-based fallback NER ─────────────────────────────────────
+
+    def regex_ner(self, text: str) -> list:
+        """
+        Zero-shot NER using NLP-03 patterns.
+        Always produces entities even when spaCy is not installed or training fails.
+        """
+        try:
+            import sys
+            sys.path.insert(0, str(self.output_dir.parent))
+            from nlp03_annotation import ENTITY_SEEDS, LABEL_PRIORITY
+        except ImportError:
+            return []
+
+        entities = []
+        for label, patterns in ENTITY_SEEDS.items():
+            for pat in patterns:
+                try:
+                    for m in re.finditer(pat, text, re.IGNORECASE | re.UNICODE):
+                        entities.append({
+                            "text":       m.group(0),
+                            "label":      label,
+                            "start":      m.start(),
+                            "end":        m.end(),
+                            "confidence": 0.70,
+                            "source":     "regex",
+                        })
+                except Exception:
+                    pass
+
+        # Deduplicate — longest span wins at each position
+        entities.sort(key=lambda e: (e["start"], -(e["end"] - e["start"])))
+        deduped, last_end = [], -1
+        for e in entities:
+            if e["start"] >= last_end:
+                deduped.append(e)
+                last_end = e["end"]
+        return deduped
+
+    # ── spaCy training ───────────────────────────────────────────────
 
     def train_spacy_ner(self, training_data: list) -> dict:
-        """Create and train a blank spaCy NER model."""
         if not SPACY_AVAILABLE:
-            return {"error": "spaCy not installed. Run: pip install spacy"}
+            return {"error": "spaCy not installed — pip install spacy"}
 
-        self.logger.info("  Training spaCy NER model...")
-        nlp = spacy.blank("xx")  # multilingual blank model
+        self.logger.info("  Training spaCy NER model…")
+        nlp = spacy.blank("xx")
         ner = nlp.add_pipe("ner")
         for label in NER_LABELS:
             ner.add_label(label)
 
-        if not training_data:
-            self.logger.warning("  No training data found — saving untrained model")
-            model_path = self.output_dir / "spacy_ner_model"
+        model_path = self.output_dir / "spacy_ner_model"
+
+        if len(training_data) < MIN_TRAINING_DOCS:
+            self.logger.warning(
+                f"  Only {len(training_data)} docs — minimum {MIN_TRAINING_DOCS}. "
+                "Saving untrained model; regex fallback will be used."
+            )
             nlp.to_disk(str(model_path))
             return {"model_path": str(model_path), "trained": False}
 
@@ -115,112 +147,127 @@ class NERModelTrainer:
         for epoch in range(30):
             random.shuffle(training_data)
             losses = {}
-            batches = minibatch(training_data, size=compounding(4.0, 32.0, 1.001))
-            for batch in batches:
+            for batch in minibatch(training_data, size=compounding(4.0, 32.0, 1.001)):
                 examples = []
                 for text, annotations in batch:
-                    doc = nlp.make_doc(text)
+                    doc     = nlp.make_doc(text)
                     example = Example.from_dict(doc, annotations)
                     examples.append(example)
                 nlp.update(examples, drop=0.35, losses=losses)
             if epoch % 10 == 0:
-                self.logger.info(f"  Epoch {epoch}: NER loss = {losses.get('ner', 0):.3f}")
+                self.logger.debug(f"  Epoch {epoch}: loss={losses.get('ner',0):.3f}")
 
-        model_path = self.output_dir / "spacy_ner_model"
         nlp.to_disk(str(model_path))
         self.logger.info(f"  spaCy model saved → {model_path}")
         return {"model_path": str(model_path), "trained": True, "epochs": 30}
 
-    # ------------------------------------------------------------------ #
-    #  Run NER inference on files                                          #
-    # ------------------------------------------------------------------ #
-
-    def run_ner_inference(self, nlp_model, text: str) -> list:
-        """Run NER on text and return entity list."""
-        doc = nlp_model(text[:1_000_000])  # safety limit
+    def run_model_inference(self, nlp_model, text: str) -> list:
+        doc = nlp_model(text[:1_000_000])
         return [
             {"text": ent.text, "label": ent.label_,
-             "start": ent.start_char, "end": ent.end_char}
+             "start": ent.start_char, "end": ent.end_char,
+             "confidence": 0.90, "source": "spacy_model"}
             for ent in doc.ents
         ]
 
-    # ------------------------------------------------------------------ #
-    #  Runner                                                              #
-    # ------------------------------------------------------------------ #
+    def merge_entities(self, model_ents: list, regex_ents: list) -> list:
+        """Model entities take priority; regex fills gaps."""
+        model_spans = {(e["start"], e["end"]) for e in model_ents}
+        combined    = list(model_ents)
+        for re_ent in regex_ents:
+            overlaps = any(
+                not (re_ent["end"] <= ms or re_ent["start"] >= me)
+                for ms, me in model_spans
+            )
+            if not overlaps:
+                combined.append(re_ent)
+        combined.sort(key=lambda e: e["start"])
+        return combined
+
+    # ── Runner ───────────────────────────────────────────────────────
 
     def run(self) -> dict:
         output_files = []
-        errors = []
+        errors       = []
 
-        # Write model card
-        model_card = {
-            "task": "NLP-05",
-            "model_type": "spaCy NER (multilingual blank)",
-            "labels": NER_LABELS,
-            "recommended_backbone": RECOMMENDED_MODELS,
-            "training_notes": (
-                "For best Sanskrit/Malayalam results, fine-tune "
-                "ai4bharat/indic-bert with spaCy-transformers. "
-                "Install: pip install spacy spacy-transformers transformers"
-            ),
-            "spacy_available": SPACY_AVAILABLE,
-            "transformers_available": TRANSFORMERS_AVAILABLE,
-        }
-        card_path = self.output_dir / "model_card.json"
-        card_path.write_text(json.dumps(model_card, indent=2), encoding="utf-8")
+        # Model card
+        (self.output_dir / "model_card.json").write_text(
+            json.dumps({
+                "task": "NLP-05",
+                "model_type": "spaCy NER (multilingual) + regex ensemble",
+                "labels": NER_LABELS,
+                "recommended_backbone": RECOMMENDED_MODELS,
+                "spacy_available": SPACY_AVAILABLE,
+                "transformers_available": TRANSFORMERS_AVAILABLE,
+            }, indent=2),
+            encoding="utf-8",
+        )
 
-        # Load training data from NLP-03 output
         training_data = self.load_training_data()
-        self.logger.info(f"  NLP-05: {len(training_data)} annotated docs loaded for NER training")
 
-        # Train / load model
+        # Train / load spaCy model
+        nlp_model  = None
         ner_result = {}
-        nlp_model = None
         if SPACY_AVAILABLE:
             ner_result = self.train_spacy_ner(training_data)
             try:
-                model_path = ner_result.get("model_path")
-                if model_path:
-                    nlp_model = spacy.load(model_path)
-            except Exception:
-                pass
+                mp = ner_result.get("model_path")
+                if mp and ner_result.get("trained"):
+                    nlp_model = spacy.load(mp)
+            except Exception as e:
+                self.logger.warning(f"  Could not load trained model: {e}")
         else:
-            self.logger.warning("  spaCy not available — skipping model training")
-            ner_result = {"error": "spaCy not installed"}
+            self.logger.warning("  spaCy unavailable — using regex-only NER")
+            ner_result = {"trained": False, "error": "spaCy not installed"}
 
-        # Run inference on each file and save NER output
         entity_total = 0
         for f in self.input_files:
             try:
+                # Resolve to a text file if we were passed a JSON file
+                if f.suffix == ".json":
+                    self.logger.debug(f"  Skipping non-text input: {f.name}")
+                    continue
+
                 text = f.read_text(encoding="utf-8", errors="replace")
-                entities = []
-                if nlp_model:
-                    entities = self.run_ner_inference(nlp_model, text)
-                    entity_total += len(entities)
+
+                model_ents = self.run_model_inference(nlp_model, text) if nlp_model else []
+                regex_ents = self.regex_ner(text)
+                entities   = self.merge_entities(model_ents, regex_ents)
+                entity_total += len(entities)
 
                 result = {
-                    "source_file": f.name,
-                    "model": "spacy_ner_ayurveda",
-                    "entities": entities,
+                    "source_file":  f.name,
+                    "model":        "spacy_ner + regex_ensemble",
+                    "entities":     entities,
                     "entity_count": len(entities),
+                    "model_count":  len(model_ents),
+                    "regex_count":  len(regex_ents),
                 }
+
+                # FIX: append out_file (the NER json), NOT f (the original text)
                 out_file = self.output_dir / (f.stem + "_ner.json")
                 out_file.write_text(
                     json.dumps(result, ensure_ascii=False, indent=2),
-                    encoding="utf-8"
+                    encoding="utf-8",
                 )
-                output_files.append(f)
+                output_files.append(out_file)   # ← FIXED (was 'f')
+                self.logger.debug(
+                    f"  {f.name}: {len(entities)} entities "
+                    f"(model:{len(model_ents)}, regex:{len(regex_ents)})"
+                )
             except Exception as e:
                 errors.append(str(e))
                 self.logger.error(f"  ERROR in NER for {f.name}: {e}")
 
-        summary = (f"{len(output_files)} files processed, "
-                   f"{entity_total} entities extracted, "
-                   f"training docs: {len(training_data)}")
+        summary = (
+            f"{len(output_files)} files, {entity_total} entities extracted, "
+            f"training docs: {len(training_data)}"
+        )
         return {
-            "task": "NLP-05",
+            "task":         "NLP-05",
             "output_files": output_files,
-            "ner_result": ner_result,
+            "ner_result":   ner_result,
             "entity_total": entity_total,
-            "summary": summary,
+            "errors":       errors,
+            "summary":      summary,
         }
